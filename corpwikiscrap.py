@@ -1,6 +1,6 @@
 """
 CorporationWiki Automated Bulk Scraper - UNLIMITED PAGES
-Clicks next arrow button until disabled - goes beyond page 11!
+Now with MinIO upload functionality
 """
 
 import asyncio
@@ -14,6 +14,8 @@ import logging
 from bs4 import BeautifulSoup
 import re
 from dotenv import load_dotenv
+from minio import Minio
+from minio.error import S3Error
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -24,19 +26,110 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 load_dotenv()
 
 CREDENTIALS = {
-     'email': os.getenv('CORPORATIONWIKI_EMAIL'),
-     'password': os.getenv('CORPORATIONWIKI_PASSWORD')
- }
+    'email': os.getenv('CORPORATIONWIKI_EMAIL'),
+    'password': os.getenv('CORPORATIONWIKI_PASSWORD')
+}
 
+# MinIO Configuration
+MINIO_CONFIG = {
+    'endpoint': 's3.us-east-005.oriobjects.cloud',
+    'access_key': '005775aede18e2e0000000023',
+    'secret_key': 'K005GD3X7YxPdbUEtP9mfYwatqf/ugg',
+    'bucket_name': 'holacracydata',
+    'folder_path': 'corporation_wiki',  # Folder inside bucket
+    'region': 'us-east-1',  # Set region explicitly to avoid permission check
+    'secure': True  # Use HTTPS
+}
+
+
+class MinIOUploader:
+    """Simple MinIO uploader - no permission checks, just upload"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.client = None
+        
+    def connect(self):
+        """Connect to MinIO"""
+        try:
+            # Set region explicitly to avoid region lookup which requires extra permissions
+            self.client = Minio(
+                self.config['endpoint'],
+                access_key=self.config['access_key'],
+                secret_key=self.config['secret_key'],
+                secure=self.config['secure'],
+                region=self.config.get('region', 'us-east-1')  # Default region
+            )
+            logger.info("✅ Connected to MinIO")
+            return True
+        except Exception as e:
+            logger.error(f"❌ MinIO connection failed: {e}")
+            return False
+    
+    def ensure_bucket(self):
+        """Skip bucket checks - just return True"""
+        logger.info(f"ℹ️  Skipping bucket verification (will test on first upload)")
+        return True
+    
+    def upload_file(self, local_path, remote_name=None):
+        """Upload file to MinIO - direct upload, no checks"""
+        try:
+            if not remote_name:
+                remote_name = os.path.basename(local_path)
+            
+            # Add folder path
+            folder_path = self.config.get('folder_path', '')
+            if folder_path:
+                remote_name = f"{folder_path}/{remote_name}"
+            
+            bucket_name = self.config['bucket_name']
+            
+            logger.info(f"📤 Uploading {remote_name} to {bucket_name}...")
+            
+            # Direct upload attempt
+            self.client.fput_object(
+                bucket_name,
+                remote_name,
+                local_path
+            )
+            
+            logger.info(f"✅ Uploaded successfully: {bucket_name}/{remote_name}")
+            return True
+            
+        except S3Error as e:
+            error_code = getattr(e, 'code', '')
+            error_msg = str(e)
+            
+            logger.error(f"❌ Upload failed")
+            logger.error(f"   Code: {error_code}")
+            logger.error(f"   Message: {error_msg}")
+            logger.error(f"   Bucket: {bucket_name}")
+            logger.error(f"   Object: {remote_name}")
+            
+            # Provide helpful suggestions
+            if 'AccessDenied' in error_msg or 'not entitled' in error_msg:
+                logger.error(f"")
+                logger.error(f"   💡 TROUBLESHOOTING:")
+                logger.error(f"   1. Verify credentials have WRITE permission")
+                logger.error(f"   2. Run: mc ls mobius/{bucket_name}/{folder_path}/")
+                logger.error(f"   3. Try: mc cp test.csv mobius/{bucket_name}/{folder_path}/test.csv")
+                logger.error(f"   4. Check if bucket name is correct")
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Unexpected upload error: {e}")
+            return False
 
 
 class CorporationWikiScraper:
-    def __init__(self, credentials):
+    def __init__(self, credentials, minio_uploader=None):
         self.browser = None
         self.context = None
         self.page = None
         self.playwright = None
         self.credentials = credentials
+        self.minio_uploader = minio_uploader
         self.all_results = []
         self.current_page = 1
         self.total_pages = 0
@@ -49,7 +142,7 @@ class CorporationWikiScraper:
         self.playwright = await async_playwright().start()
         
         self.browser = await self.playwright.chromium.launch(
-            headless=True,
+            headless=False,
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
@@ -495,7 +588,7 @@ class CorporationWikiScraper:
         return self.all_results
     
     def save_results(self, company_name):
-        """Save to CSV"""
+        """Save to CSV and upload to MinIO"""
         if not self.all_results:
             logger.warning("⚠️  No results")
             return None
@@ -506,6 +599,7 @@ class CorporationWikiScraper:
         csv_filename = f"{clean_name}.csv"
         csv_path = os.path.join(OUTPUT_DIR, csv_filename)
         
+        # Save CSV locally
         with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['page', 'result_on_page', 'company_name', 'location', 
                          'company_url', 'officer_name', 'officer_url', 'officer_id', 'total_officers']
@@ -540,6 +634,15 @@ class CorporationWikiScraper:
                     })
         
         logger.info(f"✅ CSV saved: {csv_filename}")
+        
+        # Upload to MinIO
+        if self.minio_uploader:
+            upload_success = self.minio_uploader.upload_file(csv_path, csv_filename)
+            if upload_success:
+                folder_path = MINIO_CONFIG.get('folder_path', '')
+                upload_path = f"{folder_path}/{csv_filename}" if folder_path else csv_filename
+                logger.info(f"☁️  Uploaded to MinIO: {MINIO_CONFIG['bucket_name']}/{upload_path}")
+        
         return csv_path
     
     async def close(self):
@@ -576,13 +679,13 @@ def read_companies_from_csv(csv_path):
         return []
 
 
-async def scrape_company(company_name, company_index, total_companies):
+async def scrape_company(company_name, company_index, total_companies, minio_uploader):
     """Scrape a single company"""
     print("\n" + "="*80)
     print(f"Company {company_index}/{total_companies}: {company_name}")
     print("="*80 + "\n")
     
-    scraper = CorporationWikiScraper(CREDENTIALS)
+    scraper = CorporationWikiScraper(CREDENTIALS, minio_uploader)
     
     try:
         await scraper.setup()
@@ -602,7 +705,10 @@ async def scrape_company(company_name, company_index, total_companies):
             print(f"   Pages: {scraper.current_page}")
             print(f"   Companies: {len(results)}")
             print(f"   Officers: {total_officers}")
-            print(f"   File: {os.path.basename(csv_path)}\n")
+            print(f"   File: {os.path.basename(csv_path)}")
+            folder_path = MINIO_CONFIG.get('folder_path', '')
+            upload_path = f"{folder_path}/{os.path.basename(csv_path)}" if folder_path else os.path.basename(csv_path)
+            print(f"   MinIO: {MINIO_CONFIG['bucket_name']}/{upload_path}\n")
             
             return True
         else:
@@ -620,8 +726,27 @@ async def scrape_company(company_name, company_index, total_companies):
 async def main():
     """Main"""
     print("\n" + "="*80)
-    print("CorporationWiki Bulk Scraper - UNLIMITED PAGES")
+    print("CorporationWiki Bulk Scraper - UNLIMITED PAGES + MinIO Upload")
     print("="*80)
+    
+    # Setup MinIO
+    print("\n☁️  Connecting to MinIO...")
+    minio_uploader = MinIOUploader(MINIO_CONFIG)
+    
+    if not minio_uploader.connect():
+        print("❌ MinIO connection failed. Continue anyway? (y/n): ", end='')
+        if input().strip().lower() != 'y':
+            return
+        minio_uploader = None
+    else:
+        if minio_uploader.ensure_bucket():
+            folder_path = MINIO_CONFIG.get('folder_path', '')
+            bucket_display = f"{MINIO_CONFIG['bucket_name']}/{folder_path}" if folder_path else MINIO_CONFIG['bucket_name']
+            print(f"✅ MinIO ready - Bucket: {bucket_display}\n")
+        else:
+            print("⚠️  Bucket setup failed. Continue anyway? (y/n): ", end='')
+            if input().strip().lower() != 'y':
+                return
     
     input_csv = input("\nEnter CSV file path: ").strip()
     
@@ -636,7 +761,10 @@ async def main():
         return
     
     print(f"\n📋 Found {len(companies)} companies")
-    print(f"📁 Output: {OUTPUT_DIR}\n")
+    print(f"📁 Local output: {OUTPUT_DIR}")
+    folder_path = MINIO_CONFIG.get('folder_path', '')
+    bucket_display = f"{MINIO_CONFIG['bucket_name']}/{folder_path}" if folder_path else MINIO_CONFIG['bucket_name']
+    print(f"☁️  MinIO bucket: {bucket_display}\n")
     
     confirm = input("Start? (y/n): ").strip().lower()
     if confirm != 'y':
@@ -650,7 +778,7 @@ async def main():
     start_time = time.time()
     
     for index, company_name in enumerate(companies, 1):
-        success = await scrape_company(company_name, index, len(companies))
+        success = await scrape_company(company_name, index, len(companies), minio_uploader)
         
         if success:
             successful += 1
@@ -673,7 +801,10 @@ async def main():
     print(f"Success: {successful}")
     print(f"Failed: {failed}")
     print(f"Time: {total_time/60:.1f} min")
-    print(f"\n📁 Files: {OUTPUT_DIR}\n")
+    print(f"\n📁 Local files: {OUTPUT_DIR}")
+    folder_path = MINIO_CONFIG.get('folder_path', '')
+    bucket_display = f"{MINIO_CONFIG['bucket_name']}/{folder_path}" if folder_path else MINIO_CONFIG['bucket_name']
+    print(f"☁️  MinIO bucket: {bucket_display}\n")
 
 
 if __name__ == "__main__":
