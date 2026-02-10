@@ -28,10 +28,6 @@ CREDENTIALS = {
      'password': os.getenv('CORPORATIONWIKI_PASSWORD')
  }
 
-# CREDENTIALS = {
-#     'email': 'nayakaditya559@gmail.com',
-#     'password': 'Aditya@1998'
-# }
 
 
 class CorporationWikiScraper:
@@ -53,7 +49,7 @@ class CorporationWikiScraper:
         self.playwright = await async_playwright().start()
         
         self.browser = await self.playwright.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
