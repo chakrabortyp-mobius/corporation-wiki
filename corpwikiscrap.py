@@ -142,7 +142,7 @@ class CorporationWikiScraper:
         self.playwright = await async_playwright().start()
         
         self.browser = await self.playwright.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
