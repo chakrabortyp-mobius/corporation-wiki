@@ -1,2 +1,5 @@
 .env
 corporationwiki_output/
+corporationwiki_output_new/
+processed_companies.csv
+unprocessed-companies.csv
