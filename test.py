@@ -1,6 +1,6 @@
 """
 CorporationWiki Automated Bulk Scraper - OPTIMIZED FOR SPEED
-Reduced delays, smart auth handling, focused on results extraction
+With Processed/Unprocessed tracking - AUTO-START (NO INPUTS)
 """
 
 import asyncio
@@ -15,12 +15,21 @@ import re
 from dotenv import load_dotenv
 from minio import Minio
 from minio.error import S3Error
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-OUTPUT_DIR = os.path.join(os.getcwd(), 'corporationwiki_output')
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Company data CSV files directory
+COMPANY_DATA_DIR = os.path.join(os.getcwd(), 'corporationwiki_output_new')
+os.makedirs(COMPANY_DATA_DIR, exist_ok=True)
+
+# Tracking CSV files in ROOT directory
+PROCESSED_CSV = os.path.join(os.getcwd(), 'processed_companies.csv')
+UNPROCESSED_CSV = os.path.join(os.getcwd(), 'unprocessed-companies.csv')
+
+# HARDCODED INPUT CSV PATH
+INPUT_CSV_PATH = "/mnt/data/TEST_CSV/sec_companies.csv"
 
 load_dotenv()
 
@@ -35,10 +44,77 @@ MINIO_CONFIG = {
     'access_key': '005775aede18e2e0000000023',
     'secret_key': 'K005GD3X7YxPdbUEtP9mfYwatqf/ugg',
     'bucket_name': 'holacracydata',
-    'folder_path': 'corporation_wiki',
+    'folder_path': 'corporation_wiki_new',
     'region': 'us-east-1',
     'secure': True
 }
+
+
+class TrackingCSV:
+    """Handle processed and unprocessed company tracking"""
+    
+    def __init__(self):
+        self.processed_csv = PROCESSED_CSV
+        self.unprocessed_csv = UNPROCESSED_CSV
+        self._init_files()
+    
+    def _init_files(self):
+        """Initialize CSV files with headers if they don't exist"""
+        
+        # Processed companies CSV - ONLY SUCCESSFUL COMPANIES WITH RESULTS
+        if not os.path.exists(self.processed_csv):
+            with open(self.processed_csv, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'company_name', 
+                    'total_companies_found', 
+                    'total_pages',
+                    'total_officers',
+                    'timestamp',
+                    'csv_filename'
+                ])
+        
+        # Unprocessed companies CSV - ONLY COMPANIES WITH NO RESULTS
+        if not os.path.exists(self.unprocessed_csv):
+            with open(self.unprocessed_csv, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'company_name',
+                    'timestamp',
+                    'search_term'
+                ])
+    
+    def log_processed(self, company_name, total_companies=0, total_pages=0, 
+                     total_officers=0, csv_filename=''):
+        """Log a successfully processed company (ONLY companies WITH results)"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        with open(self.processed_csv, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                company_name,
+                total_companies,
+                total_pages,
+                total_officers,
+                timestamp,
+                csv_filename
+            ])
+        
+        logger.info(f"📊 Added to processed_companies.csv: {company_name}")
+    
+    def log_unprocessed(self, company_name):
+        """Log a company with no results"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        with open(self.unprocessed_csv, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                company_name,
+                timestamp,
+                company_name  # search_term
+            ])
+        
+        logger.info(f"📊 Added to unprocessed-companies.csv: {company_name}")
 
 
 class MinIOUploader:
@@ -77,11 +153,11 @@ class MinIOUploader:
             bucket_name = self.config['bucket_name']
             
             self.client.fput_object(bucket_name, remote_name, local_path)
-            logger.info(f"✅ Uploaded: {bucket_name}/{remote_name}")
+            logger.info(f"✅ Uploaded to MinIO: {bucket_name}/{remote_name}")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Upload failed: {e}")
+            logger.error(f"❌ MinIO upload failed: {e}")
             return False
 
 
@@ -98,7 +174,7 @@ class FastCorporationWikiScraper:
         self.all_results = []
         self.current_page = 1
         self.is_logged_in = False
-        self.auth_handled = False  # Track if we've handled auth once
+        self.auth_handled = False
     
     async def setup(self):
         """Setup browser - optimized"""
@@ -157,14 +233,13 @@ class FastCorporationWikiScraper:
             return False
     
     async def handle_auth_if_needed(self):
-        """Handle authentication popup - same logic as working code"""
+        """Handle authentication popup"""
         
-        # If we've already handled auth, check if modal appeared again
         if self.auth_handled:
             try:
                 modal = await self.page.query_selector('.modal.show, .modal[style*="display: block"]')
                 if not modal:
-                    return True  # No modal, continue
+                    return True
             except:
                 return True
         
@@ -191,7 +266,6 @@ class FastCorporationWikiScraper:
             
             content = await self.page.content()
             
-            # Check if it's REGISTER modal
             if 'confirm password' in content.lower() or 'register for a free account' in content.lower():
                 logger.info("📝 REGISTER modal detected")
                 
@@ -322,13 +396,11 @@ class FastCorporationWikiScraper:
         """Fast next page navigation"""
         
         try:
-            # Find next arrow - simplified approach
             next_link = await self.page.query_selector('#search_pager li:last-child a')
             
             if not next_link:
                 return False
             
-            # Check if parent li is disabled
             parent_li = await next_link.evaluate_handle('a => a.closest("li")')
             is_disabled = await parent_li.evaluate('li => li.classList.contains("disabled")')
             
@@ -336,10 +408,7 @@ class FastCorporationWikiScraper:
                 logger.info("✅ Last page reached")
                 return False
             
-            # Click next
             await next_link.click()
-            
-            # Wait for results to load
             await self.page.wait_for_selector('.list-group-item', timeout=10000)
             
             self.current_page += 1
@@ -355,16 +424,13 @@ class FastCorporationWikiScraper:
         """Fast scraping - parse HTML directly"""
         
         try:
-            # Get HTML content
             content = await self.page.content()
             soup = BeautifulSoup(content, 'html.parser')
             
-            # Find results container
             results_container = soup.find('div', {'id': 'results-details'})
             if not results_container:
                 return []
             
-            # Get all result items
             result_items = results_container.find_all('div', class_='list-group-item')
             
             if not result_items:
@@ -399,13 +465,11 @@ class FastCorporationWikiScraper:
                 'total_officers': 0
             }
             
-            # Company name and URL
             company_link = item.find('a', class_='ellipsis')
             if company_link:
                 result['company_name'] = company_link.get_text(strip=True)
                 result['company_url'] = urljoin('https://www.corporationwiki.com', company_link.get('href', ''))
             
-            # Location
             if company_link:
                 parent_div = company_link.find_parent('div', class_='col-xs-12')
                 if parent_div:
@@ -413,10 +477,8 @@ class FastCorporationWikiScraper:
                     location = full_text.replace(result['company_name'], '').strip()
                     result['location'] = re.sub(r'^,\s*', '', location)
             
-            # Officers - get all <a> tags in officers column
             officers_col = item.find('div', class_='col-xs-12 col-lg-7')
             if officers_col:
-                # Get all officer links (including hidden ones)
                 officer_links = officers_col.find_all('a', attrs={'data-entity-id': True})
                 
                 for officer_link in officer_links:
@@ -446,10 +508,8 @@ class FastCorporationWikiScraper:
         self.all_results = []
         self.current_page = 1
         
-        # Handle auth if needed on first page
         await self.handle_auth_if_needed()
         
-        # Scrape first page
         results = await self.scrape_current_page()
         if not results:
             logger.error("❌ No results on first page")
@@ -458,18 +518,14 @@ class FastCorporationWikiScraper:
         self.all_results.extend(results)
         logger.info(f"✅ Page 1: {len(results)} results")
         
-        # Scrape remaining pages
         page_count = 1
         
         while True:
-            # Check auth before each page navigation
             await self.handle_auth_if_needed()
             
-            # Try to go to next page
             if not await self.click_next_page():
                 break
             
-            # Scrape page
             results = await self.scrape_current_page()
             if not results:
                 break
@@ -477,7 +533,6 @@ class FastCorporationWikiScraper:
             self.all_results.extend(results)
             page_count += 1
             
-            # Small delay between pages (minimal)
             await asyncio.sleep(0.5)
         
         logger.info(f"✅ COMPLETE: {page_count} pages, {len(self.all_results)} total results")
@@ -491,14 +546,12 @@ class FastCorporationWikiScraper:
             logger.warning("⚠️  No results to save")
             return None
         
-        # Clean filename
         clean_name = re.sub(r'[^\w\s-]', '', company_name).strip()
         clean_name = re.sub(r'[-\s]+', '_', clean_name)
         
         csv_filename = f"{clean_name}.csv"
-        csv_path = os.path.join(OUTPUT_DIR, csv_filename)
+        csv_path = os.path.join(COMPANY_DATA_DIR, csv_filename)
         
-        # Write CSV
         with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             fieldnames = ['page', 'result_on_page', 'company_name', 'location', 
                          'company_url', 'officer_name', 'officer_url', 'officer_id', 'total_officers']
@@ -532,13 +585,12 @@ class FastCorporationWikiScraper:
                         'total_officers': result['total_officers']
                     })
         
-        logger.info(f"💾 Saved: {csv_filename}")
+        logger.info(f"💾 Saved company data: {csv_filename}")
         
-        # Upload to MinIO
         if self.minio_uploader:
             self.minio_uploader.upload_file(csv_path, csv_filename)
         
-        return csv_path
+        return csv_path, csv_filename
     
     async def close(self):
         """Cleanup"""
@@ -565,7 +617,7 @@ def read_companies_from_csv(csv_path):
                 if 'title' in row and row['title']:
                     companies.append(row['title'].strip())
         
-        logger.info(f"📊 Loaded {len(companies)} companies")
+        logger.info(f"📊 Loaded {len(companies)} companies from {csv_path}")
         return companies
         
     except Exception as e:
@@ -573,8 +625,9 @@ def read_companies_from_csv(csv_path):
         return []
 
 
-async def scrape_company_fast(company_name, company_index, total_companies, minio_uploader):
-    """Scrape a single company - fast mode"""
+async def scrape_company_fast(company_name, company_index, total_companies, 
+                            minio_uploader, tracking_csv):
+    """Scrape a single company - with tracking"""
     
     print(f"\n[{company_index}/{total_companies}] {company_name}")
     
@@ -590,15 +643,28 @@ async def scrape_company_fast(company_name, company_index, total_companies, mini
         results = await scraper.scrape_all_pages_fast()
         
         if results:
-            scraper.save_results(company_name)
+            csv_path, csv_filename = scraper.save_results(company_name)
             
             total_officers = sum(len(r.get('officers', [])) for r in results)
             
             print(f"✅ {len(results)} companies, {total_officers} officers, {scraper.current_page} pages")
             
+            # Log to processed CSV
+            tracking_csv.log_processed(
+                company_name=company_name,
+                total_companies=len(results),
+                total_pages=scraper.current_page,
+                total_officers=total_officers,
+                csv_filename=csv_filename
+            )
+            
             return True
         else:
-            logger.warning(f"⚠️  No results")
+            logger.warning(f"⚠️  No results found")
+            
+            # Log to unprocessed CSV
+            tracking_csv.log_unprocessed(company_name)
+            
             return False
         
     except Exception as e:
@@ -609,69 +675,83 @@ async def scrape_company_fast(company_name, company_index, total_companies, mini
 
 
 async def main():
-    """Main - optimized for speed"""
+    """Main - AUTO-START (NO USER INPUTS)"""
     
     print("\n" + "="*80)
-    print("CorporationWiki Fast Scraper - OPTIMIZED FOR SPEED")
+    print("CorporationWiki Fast Scraper - AUTO-START MODE")
     print("="*80)
+    print(f"\n📁 Company data files: {COMPANY_DATA_DIR}")
+    print(f"📊 Tracking files (ROOT):")
+    print(f"   - {PROCESSED_CSV} (companies WITH results)")
+    print(f"   - {UNPROCESSED_CSV} (companies with NO results)")
+    print(f"\n📥 Input CSV: {INPUT_CSV_PATH}")
+    
+    # Initialize tracking CSV handler
+    tracking_csv = TrackingCSV()
     
     # Setup MinIO
     print("\n☁️  Connecting to MinIO...")
     minio_uploader = MinIOUploader(MINIO_CONFIG)
     
     if not minio_uploader.connect():
-        print("⚠️  MinIO failed. Continue with local save only? (y/n): ", end='')
-        if input().strip().lower() != 'y':
-            return
+        print("⚠️  MinIO failed. Continuing with local save only...")
         minio_uploader = None
     else:
         folder_path = MINIO_CONFIG.get('folder_path', '')
         bucket_display = f"{MINIO_CONFIG['bucket_name']}/{folder_path}" if folder_path else MINIO_CONFIG['bucket_name']
         print(f"✅ MinIO ready: {bucket_display}")
     
-    input_csv = input("\nEnter CSV file path: ").strip()
-    
-    if not os.path.exists(input_csv):
-        print(f"❌ File not found: {input_csv}")
+    # Check if input CSV exists
+    if not os.path.exists(INPUT_CSV_PATH):
+        print(f"❌ File not found: {INPUT_CSV_PATH}")
         return
     
-    companies = read_companies_from_csv(input_csv)
+    # Load companies
+    companies = read_companies_from_csv(INPUT_CSV_PATH)
     
     if not companies:
-        print("❌ No companies found")
+        print("❌ No companies found in CSV")
         return
     
-    print(f"\n📋 Companies to scrape: {len(companies)}")
-    print(f"📁 Local output: {OUTPUT_DIR}\n")
+    print(f"\n📋 Total companies to scrape: {len(companies)}")
+    print(f"📁 Company data output: {COMPANY_DATA_DIR}")
+    print(f"📊 Tracking files:")
+    print(f"   - {PROCESSED_CSV}")
+    print(f"   - {UNPROCESSED_CSV}")
     
-    confirm = input("Start fast scraping? (y/n): ").strip().lower()
-    if confirm != 'y':
-        print("Cancelled")
-        return
+    print("\n🚀 AUTO-STARTING IN 3 SECONDS...")
+    await asyncio.sleep(3)
     
-    print("\n🚀 FAST MODE ACTIVATED\n")
+    print("\n" + "="*80)
+    print("SCRAPING IN PROGRESS")
     print("="*80)
     
     successful = 0
-    failed = 0
+    no_results = 0
     start_time = time.time()
     
     for index, company_name in enumerate(companies, 1):
-        success = await scrape_company_fast(company_name, index, len(companies), minio_uploader)
+        success = await scrape_company_fast(
+            company_name, 
+            index, 
+            len(companies), 
+            minio_uploader,
+            tracking_csv
+        )
         
         if success:
             successful += 1
         else:
-            failed += 1
+            no_results += 1
         
-        # Progress update
+        # Progress update every 5 companies
         elapsed = time.time() - start_time
         avg_time = elapsed / index
         remaining = len(companies) - index
         est_remaining = avg_time * remaining
         
         if index % 5 == 0 or index == len(companies):
-            print(f"\n📊 Progress: {index}/{len(companies)} | ✅ {successful} | ❌ {failed} | "
+            print(f"\n📊 Progress: {index}/{len(companies)} | ✅ {successful} | ❌ {no_results} | "
                   f"⏱️  {elapsed/60:.1f}min elapsed | ~{est_remaining/60:.1f}min remaining")
             print("="*80)
     
@@ -680,12 +760,15 @@ async def main():
     print("\n" + "="*80)
     print("🎉 SCRAPING COMPLETE!")
     print("="*80)
-    print(f"\nTotal companies: {len(companies)}")
-    print(f"✅ Successful: {successful}")
-    print(f"❌ Failed: {failed}")
+    print(f"\nTotal companies processed: {len(companies)}")
+    print(f"✅ Companies WITH results: {successful}")
+    print(f"❌ Companies with NO results: {no_results}")
     print(f"⏱️  Total time: {total_time/60:.1f} minutes")
     print(f"⚡ Average: {total_time/len(companies):.1f} seconds per company")
-    print(f"\n📁 Local files: {OUTPUT_DIR}")
+    print(f"\n📁 Company data CSV files: {COMPANY_DATA_DIR}")
+    print(f"📊 Tracking files:")
+    print(f"   - {PROCESSED_CSV} ({successful} companies)")
+    print(f"   - {UNPROCESSED_CSV} ({no_results} companies)")
     
     if minio_uploader:
         folder_path = MINIO_CONFIG.get('folder_path', '')
